@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import torch
-from v2_training import BackgroundFit, V2BatchAdapter, mask_training_donors, _forward, _v2_loss
+from v2_training import BackgroundFit, V2BatchAdapter, _forward, _v2_loss, train_epoch_v2, validate_epoch_v2
+from train_formal import make_grad_scaler, amp_dtype_for
 from model_v2 import TCNTargetCrossAttentionV2
 
 class RevisionTest(unittest.TestCase):
@@ -23,13 +24,11 @@ class RevisionTest(unittest.TestCase):
         batch['values'][:,:,-1,10]=1.5
         prepared=adapter.prepare(batch)
         self.assertTrue(torch.equal(prepared['physical_wind'],torch.zeros(b,d,2)))
-        os.environ['DL_TCN_V2_DONOR_MASK']='0.99999'
-        masked=mask_training_donors(prepared)
+        masked=prepared
         self.assertTrue((~masked['donor_padding_mask']).any(dim=1).all())
-        self.assertTrue(masked['donor_padding_mask'].any())
+        self.assertFalse(masked['donor_padding_mask'].any())
         for key in ['label','target_static','geometry','values','mask']:
             self.assertTrue(torch.equal(masked[key],prepared[key]),key)
-        os.environ.pop('DL_TCN_V2_DONOR_MASK')
         model=TCNTargetCrossAttentionV2()
         optimizer=torch.optim.AdamW(model.parameters(),lr=5e-4)
         for epoch in range(2):
@@ -44,5 +43,23 @@ class RevisionTest(unittest.TestCase):
                 self.assertTrue(any(g.abs().sum()>0 for g in grads))
             self.assertTrue(torch.all(aux['attention'].masked_select(masked['donor_padding_mask'][:,None,:])==0))
             optimizer.step()
+        # Exercise the actual training/validation loops, including CUDA AMP when available.
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model=model.to(device)
+        adapter=V2BatchAdapter(fit,scaler,pd.DataFrame({'longitude':[121]*8,'latitude':[24]*8}),device)
+        class Loader:
+            dataset=range(b)
+            def __len__(self): return 1
+            def __iter__(self): yield batch
+        optimizer=torch.optim.AdamW(model.parameters(),lr=5e-4)
+        grad_scaler=make_grad_scaler(amp_dtype_for(device)==torch.float16)
+        static=pd.DataFrame({'siteid':[str(i) for i in range(8)],'sitename':[str(i) for i in range(8)]})
+        timestamps=pd.date_range('2024-07-01',periods=b,freq='h')
+        for epoch in (1,2):
+            loss=train_epoch_v2(model,Loader(),optimizer,grad_scaler,device,epoch,adapter,None,station_sample_weights=torch.ones(8,device=device))
+            metrics,stations,predictions=validate_epoch_v2(model,Loader(),device,static,timestamps,epoch,adapter)
+            self.assertTrue(np.isfinite(loss) and np.isfinite(metrics['rmse']))
+            self.assertEqual(len(predictions),b)
+        print(f'Actual loop smoke: device={device}, AMP={amp_dtype_for(device)}, epochs=2, batches/epoch=1')
 
 if __name__=='__main__': unittest.main()

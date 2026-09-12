@@ -21,20 +21,23 @@ def v2_enabled() -> bool:
 def v2_config_payload() -> dict:
     return {
         "model_version": "v2",
-        "training_revision": "real_station_masked_mse_v3",
-        "background": "source-only static-ridge+IDW; source target LOO",
+        "training_revision": "full_donor_nested_background_bounded_relation_v4",
+        "learning_rate": CFG.learning_rate,
+        "weight_decay": CFG.weight_decay,
+        "dropout": CFG.dropout,
+        "gradient_clip_norm": CFG.gradient_clip_norm,
+        "epochs": CFG.max_epochs,
+        "background": "target-excluded selection and fit; exact inner ridge LOO",
+        "background_scale": 10.0,
+        "background_center": 0.0,
+        "background_penalties": [0.1, 1.0, 10.0, 100.0],
         "target_meteorology": False,
         "pm25_anomaly_channel": True,
         "static_difference_features": 49,
-        "physics_attention": "distance+along_wind+absolute_cross_wind+static_similarity",
+        "physics_attention": "zero-init signed tanh correction; cap=1; source-pair RMS scales",
         "virtual_target": False,
-        "regression_loss": "station-balanced tail-weighted MSE",
-        "wind_prior_units": "m/s, physical zero, source-only inverse normalization",
-        "donor_mask_probability": float(os.environ.get("DL_TCN_V2_DONOR_MASK", "0.15")),
-        "huber_beta": float(os.environ.get("DL_TCN_V2_HUBER_BETA", "5.0")),
-        "tail_start": float(os.environ.get("DL_TCN_V2_TAIL_START", "25.0")),
-        "event_threshold": float(os.environ.get("DL_TCN_V2_EVENT_THRESHOLD", "35.0")),
-        "tail_max_weight": float(os.environ.get("DL_TCN_V2_TAIL_MAX_WEIGHT", "3.0")),
+        "regression_loss": "station-balanced ordinary MSE",
+        "donor_mask_probability": 0.0,
         "event_loss_weight": 0.0,
         "virtual_loss_weight": 0.0,
     }
@@ -58,73 +61,55 @@ class BackgroundFit:
     loo_rmse: float
 
 
-def _ridge_predict(x_train, y_train, x_query, penalty: float) -> np.ndarray:
-    design = np.column_stack([np.ones(len(x_train)), x_train])
-    query = np.column_stack([np.ones(len(x_query)), x_query])
-    regularizer = np.eye(design.shape[1]); regularizer[0, 0] = 0.0
-    coef = np.linalg.solve(design.T @ design + penalty * regularizer, design.T @ y_train)
-    return query @ coef
-
-
 def fit_background(cube, timestamps, static_scaled, distance, source_indices) -> BackgroundFit:
-    """Fit using source-station training-period PM2.5 only; source predictions are LOO."""
+    """No persistent cache: each context owns its source-only lookup table."""
+    from background_crossfit import crossfit_background
     source = np.asarray(source_indices, dtype=int)
     tidx = np.flatnonzero(
         (timestamps >= pd.Timestamp(CFG.train_start))
         & (timestamps <= pd.Timestamp(CFG.train_end))
     )
+    if not len(tidx):
+        raise ValueError("No background training timestamps")
     pm = CFG.aq_cube_items.index("PM2.5")
-    # Deliberately index source stations only. Held-out PM2.5 is not even read.
-    observed = np.full(len(static_scaled), np.nan, dtype="float64")
+    observed = np.full(len(static_scaled), np.nan, dtype=np.float64)
     observed[source] = np.nanmean(
-        np.asarray(cube[np.ix_(tidx, source, [pm])])[..., 0], axis=0
+        np.asarray(cube[np.ix_(tidx, source, [pm])])[..., 0], axis=0,
     )
-    if not np.isfinite(observed[source]).all():
-        raise RuntimeError("V2 background: source station存在無法估計的全年PM2.5平均")
-    x = np.asarray(static_scaled, dtype="float64")
-    y = observed[source].astype("float64")
-    lambdas = (0.1, 1.0, 10.0, 100.0)
-    best = None
-    for penalty in lambdas:
-        static_loo = np.empty(len(source), dtype="float64")
-        idw_loo = np.empty(len(source), dtype="float64")
-        for pos, station in enumerate(source):
-            keep = np.arange(len(source)) != pos
-            static_loo[pos] = _ridge_predict(x[source[keep]], y[keep], x[[station]], penalty)[0]
-            d = np.maximum(distance[station, source[keep]] / 1000.0, 1e-3)
-            w = 1.0 / np.square(d)
-            idw_loo[pos] = np.sum(w * y[keep]) / np.sum(w)
-        delta = static_loo - idw_loo
-        denom = float(delta @ delta)
-        alpha = float(np.clip(((y - idw_loo) @ delta) / denom, 0.0, 1.0)) if denom > 0 else 0.0
-        blended = alpha * static_loo + (1.0 - alpha) * idw_loo
-        rmse = float(np.sqrt(np.mean(np.square(blended - y))))
-        if best is None or rmse < best[0]:
-            best = (rmse, penalty, alpha, blended)
-    assert best is not None
-    rmse, penalty, alpha, source_loo = best
-    static_all = _ridge_predict(x[source], y, x, penalty)
-    idw_all = np.empty(len(x), dtype="float64")
-    for station in range(len(x)):
-        available = source[source != station]
-        d = np.maximum(distance[station, available] / 1000.0, 1e-3)
-        w = 1.0 / np.square(d)
-        idw_all[station] = np.sum(w * observed[available]) / np.sum(w)
-    predicted = alpha * static_all + (1.0 - alpha) * idw_all
-    predicted[source] = source_loo
-    center = float(y.mean()); scale = float(y.std())
-    if not np.isfinite(scale) or scale < 1e-6: scale = 1.0
+    predicted, penalty, alpha, _ = crossfit_background(
+        static_scaled, observed, distance, source,
+    )
+    rmse = float(np.sqrt(np.mean((predicted[source] - observed[source])**2)))
     return BackgroundFit(
-        predicted.astype("float32"), observed.astype("float32"), center, scale,
-        float(penalty), float(alpha), float(rmse),
+        predicted.astype("float32"), observed.astype("float32"),
+        0.0, 10.0, penalty, alpha, rmse,
     )
+
+
+def relation_scales(static_scaled, distance, source, scaler):
+    """Fit distance/static RMS to off-diagonal TRAIN source pairs only."""
+    source = np.asarray(source, dtype=int)
+    off = ~np.eye(len(source), dtype=bool)
+    logd = np.log1p(np.asarray(distance)[np.ix_(source, source)] / 1000)
+    xs = np.asarray(static_scaled, dtype=np.float64)[source]
+    differences = np.mean((xs[:, None] - xs[None, :])**2, axis=-1)
+    return np.asarray([
+        max(float(np.sqrt(np.mean(logd[off]**2))), 1e-6),
+        max(float(scaler.dynamic_std[-2]), 1e-6),
+        max(float(scaler.dynamic_std[-1]), 1e-6),
+        max(float(np.sqrt(np.mean(differences[off]**2))), 1e-6),
+    ], dtype="float32")
 
 
 class V2BatchAdapter:
     """Adds only source-fitted context. It never reads target meteorology."""
 
-    def __init__(self, background: BackgroundFit, scaler, static, device):
+    def __init__(self, background: BackgroundFit, scaler, static, device, prior_scales=None):
         self.device = device
+        self.prior_scales = torch.as_tensor(
+            np.ones(4, dtype="float32") if prior_scales is None else prior_scales,
+            dtype=torch.float32, device=device,
+        )
         self.predicted = torch.as_tensor(background.predicted, device=device)
         observed = background.observed.copy()
         observed[~np.isfinite(observed)] = background.center
@@ -154,6 +139,7 @@ class V2BatchAdapter:
         )
         target_raw = self.predicted[batch["target_idx"]]
         batch["values"] = values
+        batch["relation_scales"] = self.prior_scales
         batch["physical_wind"] = torch.where(
             batch["mask"][:, :, -1, 9:11] > 0,
             values[:, :, -1, 9:11] * self.wind_std + self.wind_mean,
@@ -167,9 +153,17 @@ class V2BatchAdapter:
 
 
 def build_v2_context(cube, timestamps, static_scaled, distance, source_indices, scaler, static, device):
+    started = time.perf_counter()
     fit = fit_background(cube, timestamps, static_scaled, distance, source_indices)
-    return V2BatchAdapter(fit, scaler, static, device), {
-        "method": "train-only blended static-ridge + geographic-IDW; source targets use LOO",
+    scales = relation_scales(static_scaled, distance, source_indices, scaler)
+    elapsed = time.perf_counter() - started
+    print(f"V4 background precompute: {elapsed:.3f}s; cached in context memory", flush=True)
+    return V2BatchAdapter(fit, scaler, static, device, scales), {
+        "method": "nested target-excluded selection+fit; train-period labels only",
+        "precompute_seconds": elapsed,
+        "relation_scales": scales.tolist(),
+        "source_indices": np.asarray(source_indices, dtype=int).tolist(),
+        "training_range": [CFG.train_start, CFG.train_end],
         "ridge_lambda": fit.ridge_lambda,
         "static_weight": fit.static_weight,
         "source_loo_rmse": fit.loo_rmse,
@@ -183,47 +177,18 @@ def _forward(model, batch, need_attention=False):
         batch["values"], batch["mask"], batch["donor_static"], batch["geometry"],
         batch["donor_padding_mask"], batch["target_static"], batch["time_features"],
         batch["donor_background"], batch["target_background"],
-        batch["target_background_raw"], need_attention, batch["physical_wind"],
+        batch["target_background_raw"], need_attention, batch["physical_wind"], batch["relation_scales"],
     )
 
 
-def mask_training_donors(batch):
-    """Training-only source dropout; real target/label/geometry stay unchanged."""
-    probability = float(os.environ.get("DL_TCN_V2_DONOR_MASK", "0.15"))
-    if not 0 <= probability < 1:
-        raise ValueError("DL_TCN_V2_DONOR_MASK must be in [0, 1)")
-    padding = batch["donor_padding_mask"]
-    if padding.all(dim=1).any():
-        raise ValueError("Sample has no source donors")
-    if probability == 0:
-        return batch
-    removed = (torch.rand(padding.shape, device=padding.device) < probability) & ~padding
-    # Keep one random valid source if dropout would remove every source.
-    survivor = torch.rand(padding.shape, device=padding.device).masked_fill(padding, -1).argmax(dim=1)
-    all_removed = (padding | removed).all(dim=1)
-    removed[torch.arange(len(padding), device=padding.device), survivor] &= ~all_removed
-    result = dict(batch)
-    result["donor_padding_mask"] = padding | removed
-    # Original missingness masks are not reinterpreted or imputed.
-    return result
-
-
 def _v2_loss(prediction, auxiliary, label, sample_weight, event_pos_weight):
-    start = float(os.environ.get("DL_TCN_V2_TAIL_START", "25.0"))
-    threshold = float(os.environ.get("DL_TCN_V2_EVENT_THRESHOLD", "35.0"))
-    maximum = float(os.environ.get("DL_TCN_V2_TAIL_MAX_WEIGHT", "3.0"))
-    tail = 1.0 + (maximum-1.0) * torch.clamp((label-start)/max(threshold-start, 1e-6), 0, 1)
-    regression = (prediction.float() - label.float()).square()
-    return torch.mean(sample_weight * tail * regression)
+    # Weights are fixed N/(number_of_stations * N_i), not batch-normalized.
+    return torch.mean(sample_weight * (prediction.float() - label.float()).square())
 
 
 def event_pos_weight_from_dataset(dataset, cube, device):
-    pm = CFG.aq_cube_items.index("PM2.5")
-    labels = np.asarray(cube[dataset.row_times, dataset.row_targets, pm], dtype="float32")
-    positives = int(np.sum(labels >= float(os.environ.get("DL_TCN_V2_EVENT_THRESHOLD", "35"))))
-    negatives = len(labels) - positives
-    value = min(20.0, negatives / max(positives, 1))
-    return torch.tensor(value, dtype=torch.float32, device=device)
+    # Compatibility argument only; V4 has no event classification loss.
+    return None
 
 
 def train_epoch_v2(model, loader, optimizer, grad_scaler, device, epoch, adapter,
@@ -232,7 +197,7 @@ def train_epoch_v2(model, loader, optimizer, grad_scaler, device, epoch, adapter
     loss_sum = 0.0; sample_count = 0; started = time.perf_counter()
     for batch_number, raw_batch in enumerate(loader, 1):
         batch = feature_builder(raw_batch) if feature_builder is not None else move_batch(raw_batch, device)
-        batch = mask_training_donors(adapter.prepare(batch))
+        batch = adapter.prepare(batch)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             prediction, auxiliary = _forward(model, batch)
@@ -279,18 +244,15 @@ def smoke_v2(model, raw_batch, device, adapter):
     batch = move_batch(raw_batch, device); batch = adapter.prepare(batch)
     model.train(); model.zero_grad(set_to_none=True)
     prediction, auxiliary = _forward(model, batch, True)
-    loss = F.mse_loss(prediction, batch["label"]); loss.backward()
+    loss = _v2_loss(prediction, auxiliary, batch["label"], torch.ones_like(batch["label"]), None)
+    loss.backward()
     if not torch.isfinite(prediction).all() or not torch.isfinite(loss): raise RuntimeError("V2 smoke非finite")
-    required = ("tcn.", "donor_projection.", "query_projection.", "cross_attention.", "shared_head.", "residual_head.", "event_head.")
+    required = ("tcn.", "donor_projection.", "query_projection.", "cross_attention.", "shared_head.", "residual_head.")
     for prefix in required:
         grads=[p.grad for n,p in model.named_parameters() if n.startswith(prefix)]
         if not grads or all(g is None or float(g.abs().sum()) == 0 for g in grads):
-            # event head is exercised separately below.
-            if prefix != "event_head.": raise RuntimeError(f"V2 smoke: {prefix}沒有gradient")
-    model.zero_grad(set_to_none=True)
-    _, event_auxiliary = _forward(model, batch, False)
-    event_auxiliary["event_logit"].mean().backward()
-    if not any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.event_head.parameters()):
-        raise RuntimeError("V2 event head沒有finite gradient")
+            raise RuntimeError(f"V4 smoke: {prefix}沒有gradient")
+        if any(g is not None and not torch.isfinite(g).all() for g in grads):
+            raise RuntimeError(f"V4 smoke: {prefix} nonfinite gradient")
     return {"prediction_shape":list(prediction.shape),"loss":float(loss.detach().cpu()),
             "parameters":sum(p.numel() for p in model.parameters()),"attention_finite":bool(torch.isfinite(auxiliary["attention"]).all())}

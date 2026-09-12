@@ -130,6 +130,19 @@ def run_fold(
     # fold. Resume later restores the exact post-epoch RNG state.
     seed_all(CFG.seed+fold_id*1009)
     fold_dir=root/f"fold_{fold_id:02d}"
+    if v2_enabled():
+        version_path=fold_dir/'training_revision.json'
+        expected={'training':v2_config_payload(),'train':np.asarray(train_idx).tolist(),
+                  'validation':np.asarray(val_idx).tolist(), 'epochs':CFG.max_epochs,
+                  'lr':CFG.learning_rate,'weight_decay':CFG.weight_decay,'dropout':CFG.dropout}
+        if version_path.exists():
+            if json.loads(version_path.read_text(encoding='utf-8')) != expected:
+                raise RuntimeError('Fold training revision/split changed; use a fresh root')
+        elif fold_dir.exists() and any(fold_dir.iterdir()):
+            raise RuntimeError('Unversioned fold results cannot be reused as V4')
+        else:
+            fold_dir.mkdir(parents=True,exist_ok=True)
+            atomic_text_save(version_path,json.dumps(expected,indent=2))
     epoch_dir=fold_dir/"epoch_checkpoints"; prediction_dir=fold_dir/"epoch_predictions"
     station_metric_path=fold_dir/"validation_station_metrics_all_epochs.csv"
     paths=[fold_dir,epoch_dir]
