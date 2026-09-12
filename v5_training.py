@@ -104,7 +104,12 @@ def first_order_mldg_step(model,s_batch,q_batch,optimizer,s_weights,q_weights,al
         }
     for (_,p),gs,gq in zip(named.items(),g_s,g_q):
         if gs is None and gq is None: continue
-        p.grad=(torch.zeros_like(p) if gs is None else gs.detach())+beta*(torch.zeros_like(p) if gq is None else gq.detach())
+        combined=(torch.zeros_like(p) if gs is None else gs.detach()) \
+                 +beta*(torch.zeros_like(p) if gq is None else gq.detach())
+        # functional_call + autocast can return a gradient view whose dtype or
+        # layout differs from the FP32 parameter. Fused AdamW requires all four
+        # state tensors to match exactly.
+        p.grad=combined.to(device=p.device,dtype=p.dtype).contiguous()
     # A single fused check avoids one GPU synchronization per parameter.
     torch.nn.utils.clip_grad_norm_(parameters,CFG.gradient_clip_norm,error_if_nonfinite=True)
     if do_update: optimizer.step()

@@ -99,4 +99,19 @@ class V5Tests(unittest.TestCase):
         result=event_metrics(np.array([40.,10.]),np.array([10.,10.]))
         self.assertEqual(result['event_recall'],0.0);self.assertEqual(result['event_f1'],0.0)
 
+    @unittest.skipUnless(torch.cuda.is_available(),'CUDA required')
+    def test_amp_gradients_are_compatible_with_fused_adamw(self):
+        device=torch.device('cuda');model=FactorizedResidualKriging().to(device)
+        try: optimizer=torch.optim.AdamW(model.parameters(),lr=1e-4,fused=True)
+        except (TypeError,RuntimeError): self.skipTest('fused AdamW unavailable')
+        b={key:(value.to(device) if torch.is_tensor(value) else value) for key,value in batch().items()}
+        weights=make_station_weights(b['target_idx'].cpu().numpy(),73,device)
+        dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        first_order_mldg_step(model,b,b,optimizer,weights,weights,0.0,amp_dtype=dtype)
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                self.assertEqual(parameter.grad.dtype,parameter.dtype)
+                self.assertEqual(parameter.grad.device,parameter.device)
+                self.assertTrue(parameter.grad.is_contiguous())
+
 if __name__=='__main__': unittest.main()
