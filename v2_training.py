@@ -21,18 +21,22 @@ def v2_enabled() -> bool:
 def v2_config_payload() -> dict:
     return {
         "model_version": "v2",
+        "training_revision": "real_station_masked_mse_v3",
         "background": "source-only static-ridge+IDW; source target LOO",
         "target_meteorology": False,
         "pm25_anomaly_channel": True,
         "static_difference_features": 49,
         "physics_attention": "distance+along_wind+absolute_cross_wind+static_similarity",
-        "virtual_target": "source station-pair spatial mixup",
+        "virtual_target": False,
+        "regression_loss": "station-balanced tail-weighted MSE",
+        "wind_prior_units": "m/s, physical zero, source-only inverse normalization",
+        "donor_mask_probability": float(os.environ.get("DL_TCN_V2_DONOR_MASK", "0.15")),
         "huber_beta": float(os.environ.get("DL_TCN_V2_HUBER_BETA", "5.0")),
         "tail_start": float(os.environ.get("DL_TCN_V2_TAIL_START", "25.0")),
         "event_threshold": float(os.environ.get("DL_TCN_V2_EVENT_THRESHOLD", "35.0")),
         "tail_max_weight": float(os.environ.get("DL_TCN_V2_TAIL_MAX_WEIGHT", "3.0")),
-        "event_loss_weight": float(os.environ.get("DL_TCN_V2_EVENT_LOSS_WEIGHT", "0.1")),
-        "virtual_loss_weight": float(os.environ.get("DL_TCN_V2_VIRTUAL_LOSS_WEIGHT", "0.1")),
+        "event_loss_weight": 0.0,
+        "virtual_loss_weight": 0.0,
     }
 
 
@@ -150,76 +154,16 @@ class V2BatchAdapter:
         )
         target_raw = self.predicted[batch["target_idx"]]
         batch["values"] = values
+        batch["physical_wind"] = torch.where(
+            batch["mask"][:, :, -1, 9:11] > 0,
+            values[:, :, -1, 9:11] * self.wind_std + self.wind_mean,
+            0.0,
+        )
         batch["donor_background"] = (donor_climatology - self.background_center) / self.background_scale
         batch["target_background_raw"] = target_raw
         batch["target_background"] = (target_raw - self.background_center) / self.background_scale
         return batch
 
-    @staticmethod
-    def _bearing_and_distance(donor_lon, donor_lat, target_lon, target_lat):
-        rad = torch.pi / 180.0
-        lon1, lat1 = donor_lon * rad, donor_lat * rad
-        lon2, lat2 = target_lon[:, None] * rad, target_lat[:, None] * rad
-        dlon, dlat = lon2 - lon1, lat2 - lat1
-        a = torch.sin(dlat / 2).square() + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).square()
-        distance_km = 2 * 6371.0 * torch.asin(torch.sqrt(torch.clamp(a, 0, 1)))
-        x = torch.sin(dlon) * torch.cos(lat2)
-        y = torch.cos(lat1) * torch.sin(lat2) - torch.sin(lat1) * torch.cos(lat2) * torch.cos(dlon)
-        bearing = torch.atan2(x, y)
-        return bearing, distance_km
-
-    def virtual_batch(self, batch: dict) -> tuple[dict, torch.Tensor] | tuple[None, None]:
-        # A station-pair spatial interpolation regularizer, deliberately low weight.
-        current_pm_ok = batch["mask"][:, :, -1, self.pm_channel] > 0
-        valid = current_pm_ok.any(dim=1)
-        if not valid.any(): return None, None
-        # Keep the complete B dimension so torch.compile sees the same shape on
-        # every batch. Invalid virtual rows receive zero loss weight below.
-        rows = torch.arange(len(valid), device=self.device)
-        ok = current_pm_ok
-        selector = (batch["time_idx"] + batch["target_idx"]) % ok.shape[1]
-        offsets = torch.arange(ok.shape[1], device=self.device)[None, :]
-        candidates = (selector[:, None] + offsets) % ok.shape[1]
-        first = torch.argmax(torch.gather(ok, 1, candidates).to(torch.int64), dim=1)
-        partner_pos = candidates[torch.arange(len(rows), device=self.device), first]
-        alpha = 0.35 + 0.30 * torch.remainder(
-            batch["time_idx"] * 1103515245 + batch["target_idx"] * 12345, 997
-        ).float() / 996.0
-
-        virtual = {k: (v[rows].clone() if torch.is_tensor(v) and v.ndim and v.shape[0] == len(batch["label"]) else v)
-                   for k, v in batch.items()}
-        partner_static = virtual["donor_static"][torch.arange(len(rows), device=self.device), partner_pos]
-        virtual["target_static"] = alpha[:, None] * virtual["target_static"] + (1-alpha)[:, None] * partner_static
-        partner_bg = virtual["donor_background"][torch.arange(len(rows), device=self.device), partner_pos]
-        virtual["target_background"] = alpha * virtual["target_background"] + (1-alpha) * partner_bg
-        virtual["target_background_raw"] = self.background_center + self.background_scale * virtual["target_background"]
-        partner_pm_anom = virtual["values"][torch.arange(len(rows), device=self.device), partner_pos, -1, self.pm_channel]
-        partner_raw = partner_pm_anom * self.pm_std + self.observed[virtual["donor_indices"][torch.arange(len(rows), device=self.device), partner_pos]]
-        virtual["label"] = alpha * virtual["label"] + (1-alpha) * partner_raw
-
-        donors = virtual["donor_indices"].clamp_min(0)
-        target_idx = batch["target_idx"]
-        partner_idx = virtual["donor_indices"][torch.arange(len(rows), device=self.device), partner_pos]
-        vlon = alpha * self.lon[target_idx] + (1-alpha) * self.lon[partner_idx]
-        vlat = alpha * self.lat[target_idx] + (1-alpha) * self.lat[partner_idx]
-        bearing_new, distance_new = self._bearing_and_distance(self.lon[donors], self.lat[donors], vlon, vlat)
-        sin_new, cos_new = torch.sin(bearing_new), torch.cos(bearing_new)
-        virtual["geometry"] = torch.stack([torch.log1p(distance_new), sin_new, cos_new], dim=-1)
-
-        # Rotate the already observed wind vector from the old target frame into
-        # the virtual-target frame; no target-side weather is introduced.
-        old_sin = batch["geometry"][rows, :, 1]
-        old_cos = batch["geometry"][rows, :, 2]
-        along = virtual["values"][..., 9] * self.wind_std[0] + self.wind_mean[0]
-        cross = virtual["values"][..., 10] * self.wind_std[1] + self.wind_mean[1]
-        east = along * old_sin[:, :, None] + cross * old_cos[:, :, None]
-        north = along * old_cos[:, :, None] - cross * old_sin[:, :, None]
-        new_along = east * sin_new[:, :, None] + north * cos_new[:, :, None]
-        new_cross = east * cos_new[:, :, None] - north * sin_new[:, :, None]
-        wind_mask = virtual["mask"][..., 9:11]
-        virtual["values"][..., 9] = torch.where(wind_mask[..., 0] > 0, (new_along-self.wind_mean[0])/self.wind_std[0], 0)
-        virtual["values"][..., 10] = torch.where(wind_mask[..., 1] > 0, (new_cross-self.wind_mean[1])/self.wind_std[1], 0)
-        return virtual, valid.to(torch.float32)
 
 
 def build_v2_context(cube, timestamps, static_scaled, distance, source_indices, scaler, static, device):
@@ -239,21 +183,38 @@ def _forward(model, batch, need_attention=False):
         batch["values"], batch["mask"], batch["donor_static"], batch["geometry"],
         batch["donor_padding_mask"], batch["target_static"], batch["time_features"],
         batch["donor_background"], batch["target_background"],
-        batch["target_background_raw"], need_attention,
+        batch["target_background_raw"], need_attention, batch["physical_wind"],
     )
 
 
+def mask_training_donors(batch):
+    """Training-only source dropout; real target/label/geometry stay unchanged."""
+    probability = float(os.environ.get("DL_TCN_V2_DONOR_MASK", "0.15"))
+    if not 0 <= probability < 1:
+        raise ValueError("DL_TCN_V2_DONOR_MASK must be in [0, 1)")
+    padding = batch["donor_padding_mask"]
+    if padding.all(dim=1).any():
+        raise ValueError("Sample has no source donors")
+    if probability == 0:
+        return batch
+    removed = (torch.rand(padding.shape, device=padding.device) < probability) & ~padding
+    # Keep one random valid source if dropout would remove every source.
+    survivor = torch.rand(padding.shape, device=padding.device).masked_fill(padding, -1).argmax(dim=1)
+    all_removed = (padding | removed).all(dim=1)
+    removed[torch.arange(len(padding), device=padding.device), survivor] &= ~all_removed
+    result = dict(batch)
+    result["donor_padding_mask"] = padding | removed
+    # Original missingness masks are not reinterpreted or imputed.
+    return result
+
+
 def _v2_loss(prediction, auxiliary, label, sample_weight, event_pos_weight):
-    beta = float(os.environ.get("DL_TCN_V2_HUBER_BETA", "5.0"))
     start = float(os.environ.get("DL_TCN_V2_TAIL_START", "25.0"))
     threshold = float(os.environ.get("DL_TCN_V2_EVENT_THRESHOLD", "35.0"))
     maximum = float(os.environ.get("DL_TCN_V2_TAIL_MAX_WEIGHT", "3.0"))
     tail = 1.0 + (maximum-1.0) * torch.clamp((label-start)/max(threshold-start, 1e-6), 0, 1)
-    regression = F.huber_loss(prediction, label, reduction="none", delta=beta)
-    event = (label >= threshold).to(label.dtype)
-    bce = F.binary_cross_entropy_with_logits(auxiliary["event_logit"], event, reduction="none", pos_weight=event_pos_weight)
-    event_weight = float(os.environ.get("DL_TCN_V2_EVENT_LOSS_WEIGHT", "0.1"))
-    return torch.mean(sample_weight * (tail * regression + event_weight * bce))
+    regression = (prediction.float() - label.float()).square()
+    return torch.mean(sample_weight * tail * regression)
 
 
 def event_pos_weight_from_dataset(dataset, cube, device):
@@ -269,23 +230,14 @@ def train_epoch_v2(model, loader, optimizer, grad_scaler, device, epoch, adapter
                    event_pos_weight, feature_builder=None, station_sample_weights=None):
     model.train(); amp_dtype = amp_dtype_for(device); amp_enabled = amp_dtype is not None
     loss_sum = 0.0; sample_count = 0; started = time.perf_counter()
-    virtual_weight = float(os.environ.get("DL_TCN_V2_VIRTUAL_LOSS_WEIGHT", "0.1"))
     for batch_number, raw_batch in enumerate(loader, 1):
         batch = feature_builder(raw_batch) if feature_builder is not None else move_batch(raw_batch, device)
-        batch = adapter.prepare(batch)
+        batch = mask_training_donors(adapter.prepare(batch))
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             prediction, auxiliary = _forward(model, batch)
             weights = station_sample_weights[batch["target_idx"]]
             loss = _v2_loss(prediction, auxiliary, batch["label"], weights, event_pos_weight)
-            virtual, virtual_valid = adapter.virtual_batch(batch)
-            if virtual is not None:
-                v_prediction, v_auxiliary = _forward(model, virtual)
-                v_loss = _v2_loss(
-                    v_prediction, v_auxiliary, virtual["label"],
-                    weights * virtual_valid, event_pos_weight,
-                )
-                loss = loss + virtual_weight * v_loss
         if not torch.isfinite(loss): raise RuntimeError(f"V2 epoch {epoch} batch {batch_number}: loss非finite")
         grad_scaler.scale(loss).backward(); grad_scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.gradient_clip_norm)

@@ -30,7 +30,7 @@ class PhysicsGuidedCrossAttention(nn.Module):
         self.static_strength = nn.Parameter(torch.full((self.heads,), -2.0))
 
     def forward(self, query, tokens, geometry, values, mask, padding_mask, static_similarity,
-                need_weights=False):
+                need_weights=False, physical_wind=None):
         batch, donors, dim = tokens.shape
         q = self.q(query).view(batch, self.heads, self.head_dim)
         k = self.k(tokens).view(batch, donors, self.heads, self.head_dim).transpose(1, 2)
@@ -38,8 +38,10 @@ class PhysicsGuidedCrossAttention(nn.Module):
         scores = torch.einsum("bhd,bhnd->bhn", q, k) / math.sqrt(self.head_dim)
 
         log_distance = geometry[..., 0]
-        along = values[:, :, -1, 9]
-        cross = values[:, :, -1, 10]
+        if physical_wind is None:
+            raise ValueError("Physical wind from the source-only scaler is required")
+        along = physical_wind[..., 0]
+        cross = physical_wind[..., 1]
         wind_ok = mask[:, :, -1, 9] * mask[:, :, -1, 10]
         along = along * wind_ok
         cross = cross * wind_ok
@@ -91,7 +93,7 @@ class TCNTargetCrossAttentionV2(nn.Module):
     def forward(self, values, mask, donor_static, geometry, donor_padding_mask,
                 target_static, time_features, donor_background,
                 target_background, target_background_raw,
-                need_attention_weights=False):
+                need_attention_weights=False, physical_wind=None):
         temporal = self.tcn(values, mask)
         static_difference = donor_static - target_static[:, None, :]
         background_difference = donor_background - target_background[:, None]
@@ -106,7 +108,7 @@ class TCNTargetCrossAttentionV2(nn.Module):
         attended, attention = self.cross_attention(
             query, donor_token, geometry, values, mask, donor_padding_mask,
             -static_difference.square().mean(dim=-1),
-            need_attention_weights,
+            need_attention_weights, physical_wind,
         )
         hidden = self.shared_head(torch.cat([attended, query], dim=-1))
         prediction = target_background_raw + self.residual_head(hidden).squeeze(-1)
