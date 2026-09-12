@@ -79,11 +79,18 @@ def run(root='/content/DL_TCN_V4_VALIDATION_PILOT', samples_per_station=128):
             # Restore scientific/model settings, not obsolete machine filesystem paths.
             for key in ('train_start','train_end','history_hours','raw_dynamic_items','derived_dynamic_items',
                         'aq_cube_items','tcn_hidden','tcn_kernel_size','tcn_dilations','dropout',
-                        'attention_dim','attention_heads','final_hidden','use_amp','prefer_bf16'):
+                        'attention_dim','attention_heads','final_hidden','use_amp','prefer_bf16',
+                        'batch_size','compile_mode','enable_tf32'):
                 value=ck['config'][key]
                 if isinstance(getattr(CFG,key),tuple): value=tuple(value)
                 setattr(CFG,key,value)
-            apply_runtime_profile(CFG); CFG.compile_mode='off'; CFG.formal_num_workers=0
+            saved_batch=CFG.batch_size
+            apply_runtime_profile(CFG); CFG.batch_size=saved_batch; CFG.formal_num_workers=0
+            if device.type=='cuda':
+                torch.backends.cuda.matmul.allow_tf32=CFG.enable_tf32
+                torch.backends.cudnn.allow_tf32=CFG.enable_tf32
+                torch.backends.cudnn.benchmark=True
+                torch.set_float32_matmul_precision('high' if CFG.enable_tf32 else 'highest')
             if CFG.history_hours!=24 or CFG.n_dynamic_channels!=11: raise ValueError('History/channels mismatch')
             source=np.asarray(ck['train_indices'],int); val=np.asarray(ck['validation_indices'],int)
             excluded=np.asarray(ck['outer_indices_excluded'],int)
@@ -105,6 +112,10 @@ def run(root='/content/DL_TCN_V4_VALIDATION_PILOT', samples_per_station=128):
             model=TCNTargetCrossAttentionV2(len(cols)).to(device)
             model.load_state_dict(ck['model_state_dict'],strict=True); model.eval()
             assert_tcn_causal(model,device)
+            # Replay the original execution mode, not an unconditionally eager model.
+            if device.type=='cuda' and CFG.compile_mode!='off':
+                model=torch.compile(model,mode=CFG.compile_mode,fullgraph=False,dynamic=False)
+            print(f'  replay batch={CFG.batch_size}, compile={CFG.compile_mode}, AMP={amp_dtype_for(device)}',flush=True)
             builder=None
             if device.type=='cuda':
                 builder=DeviceFeatureBuilder(source,cube,max(int(d.row_times.max()) for d in datasets.values()),
@@ -139,10 +150,17 @@ def run(root='/content/DL_TCN_V4_VALIDATION_PILOT', samples_per_station=128):
                         np.testing.assert_array_equal(s[order],saved['station_index'][old])
                         np.testing.assert_array_equal(times[ti[order]].asi8,saved['timestamp_ns'][old])
                         np.testing.assert_array_equal(y[order],saved['y_true'][old])
-                        delta=float(np.max(np.abs(p[order]-saved['y_pred'][old])))
-                        # Eager versus compiled mixed precision need not be bit-identical.
-                        print(f'  saved prediction max delta={delta:.6g} (AMP/eager may differ)',flush=True)
-                        if delta>0.1: raise ValueError('Saved prediction mismatch >0.1; investigate before interpreting')
+                        diff=p[order]-saved['y_pred'][old]
+                        delta=float(np.max(np.abs(diff)))
+                        audits[-1].update(prediction_max_delta=delta,
+                            prediction_rms_delta=float(np.sqrt(np.mean(diff**2))),
+                            prediction_mean_delta=float(diff.mean()),
+                            prediction_p99_delta=float(np.quantile(np.abs(diff),.99)),
+                            prediction_replay_pass=delta<=0.1)
+                        print(f'  prediction replay: {audits[-1]}',flush=True)
+                        if delta>0.1:
+                            # Keep useful diagnostic output, but do not silently accept mismatches.
+                            print('WARNING: replay mismatch remains. Results are provisional; do not infer a training cause.',flush=True)
                 background=adapter.predicted.cpu().numpy()
                 rows.extend(prediction_rows(y,p,s,ti,static,background,fold,epoch,split))
                 # Small, fixed random sample per station. Shift whole donor windows together.
@@ -183,6 +201,9 @@ def show(result):
     probes['rmse_increase']=probes.shuffled_rmse-probes.baseline_rmse
     print('Training 是樣本內診斷，不是泛化成績。時間打亂是敏感度對照，不是正式可部署結果。')
     display(result['audit'])
+    audit=result['audit']
+    if 'prediction_replay_pass' in audit and (audit.prediction_replay_pass.dropna()==False).any():
+        print('STOP interpretation: checkpoint replay still differs. Show the audit above first; the remaining tables are provisional, not a verified reproduction.')
     summary=frame.groupby(['fold','split']).agg(stations=('siteid','size'),macro_rmse=('rmse','mean'),
               mean_abs_bias=('final_bias',lambda x:x.abs().mean()),
               worsened_bias_stations=('abs_bias_reduction',lambda x:int((x<0).sum())),
