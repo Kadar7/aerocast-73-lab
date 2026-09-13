@@ -21,7 +21,7 @@ class FactorizationDiagnosisTests(unittest.TestCase):
             background_bias=2.,slow_bias=.5,final_bias=1.5,slow_abs_bias_reduction_vs_background=1.5,
             final_abs_bias_reduction_vs_slow=-1.,fast_worsened_slow_bias=True)])
         result=summarize(frame).iloc[0]
-        self.assertEqual(result.diagnostic_branch,'constrain_fast_station_mean')
+        self.assertEqual(result.diagnostic_branch,'fast_mean_abs_bias_increased_after_slow')
 
 
 if __name__=='__main__': unittest.main()

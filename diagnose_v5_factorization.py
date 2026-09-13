@@ -46,11 +46,11 @@ def summarize(stations):
         slow_bias_gain=float(part.slow_abs_bias_reduction_vs_background.mean())
         fast_bias_gain=float(part.final_abs_bias_reduction_vs_slow.mean())
         if slow_bias_gain<=0:
-            branch='repair_slow_spatial_environment_layer'
+            branch='slow_mean_abs_bias_not_improved'
         elif fast_bias_gain<0:
-            branch='constrain_fast_station_mean'
+            branch='fast_mean_abs_bias_increased_after_slow'
         else:
-            branch='both_stages_help_expand_validation'
+            branch='both_stage_mean_abs_bias_improved'
         rows.append({
             'fold':fold,'method':method,'stations':len(part),
             'background_macro_rmse':part.background_rmse.mean(),
@@ -73,7 +73,7 @@ def summarize(stations):
 def run(root='/content/DL_TCN_V5_FACTOR_MLDG_PILOT'):
     from tqdm.auto import tqdm
     from config import CFG,apply_runtime_profile
-    from data_pipeline import ColdStartStationDataset,build_or_load_hourly_cube,haversine_matrix,load_static
+    from data_pipeline import ColdStartStationDataset,haversine_matrix,load_static
     from model_v5 import FactorizedResidualKriging
     from run_v5_factorized_mldg_pilot import full_validation_context,target_means,raw_index_batch
     from train_formal import DeviceFeatureBuilder,amp_dtype_for
@@ -83,10 +83,28 @@ def run(root='/content/DL_TCN_V5_FACTOR_MLDG_PILOT'):
     if not (root/'settings.json').exists(): raise FileNotFoundError(f'Missing {root / "settings.json"}')
     settings=json.loads((root/'settings.json').read_text(encoding='utf-8'))
     settings_hash=hashlib.sha256(json.dumps(settings,sort_keys=True).encode()).hexdigest()
+    expected={'train_period':[CFG.train_start,CFG.train_end],'history_hours':CFG.history_hours,
+              'dynamic_items':list(CFG.dynamic_items)}
+    for key,value in expected.items():
+        if settings.get(key)!=value: raise RuntimeError(f'Current config differs from saved V5 setting: {key}')
+    architecture={'tcn_hidden':CFG.tcn_hidden,'tcn_kernel_size':CFG.tcn_kernel_size,
+        'tcn_dilations':list(CFG.tcn_dilations),'attention_dim':CFG.attention_dim,
+        'attention_heads':CFG.attention_heads,'final_hidden':CFG.final_hidden,'static_dim':49}
+    if settings.get('architecture')!=architecture: raise RuntimeError('Current architecture differs from saved V5 settings')
     apply_runtime_profile(CFG);CFG.formal_num_workers=0
     if CFG.device.type=='cuda':
         torch.set_num_threads(min(12,os.cpu_count() or 1));torch.cuda.reset_peak_memory_stats()
-    static,_,cols=load_static();cube,timestamps=build_or_load_hourly_cube(static)
+    static,_,cols=load_static();cache=CFG.output_dir/'_cache';meta_path=cache/'aq_hourly_meta.json';cube_path=cache/'aq_hourly_cube.npy'
+    if not meta_path.exists() or not cube_path.exists():
+        raise FileNotFoundError('Read-only diagnosis requires the existing AQ cube cache; it will not rebuild/write it')
+    fingerprint=lambda path:hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    fingerprints=settings.get('data_fingerprint',{})
+    actual={'cube_meta':fingerprint(meta_path),'static':fingerprint(CFG.static_path),'clusters':fingerprint(CFG.cluster_path)}
+    if fingerprints!=actual: raise RuntimeError('Current AQ/static/cluster data differ from saved V5 fingerprints')
+    meta=json.loads(meta_path.read_text(encoding='utf-8'));cube=np.load(cube_path,mmap_mode='r',allow_pickle=False)
+    timestamps=pd.date_range(meta['start'],periods=len(cube),freq='h')
+    if meta['siteids']!=static.siteid.astype(str).tolist() or meta['items']!=list(CFG.aq_cube_items) or list(cube.shape)!=meta['shape']:
+        raise RuntimeError('AQ cube schema/station order mismatch')
     distance=haversine_matrix(static.longitude,static.latitude);dtype=amp_dtype_for(CFG.device)
     for fold in settings['folds']:
         for method in settings['methods']:
