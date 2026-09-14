@@ -58,6 +58,17 @@ def rebuild_summary(output_root: Path) -> None:
         rows.append({
             'siteid': result['siteid'],
             'sitename': result['sitename'],
+            'model_version': result.get('model_version'),
+            'code_revision': result.get('provenance', {}).get('code_revision'),
+            'train_start': (result.get('provenance', {}).get('train_period') or [None, None])[0],
+            'train_end': (result.get('provenance', {}).get('train_period') or [None, None])[1],
+            'test_start': (result.get('provenance', {}).get('test_period') or [None, None])[0],
+            'test_end': (result.get('provenance', {}).get('test_period') or [None, None])[1],
+            'dynamic_channel_count': result.get('provenance', {}).get('dynamic_channel_count'),
+            'static_feature_count': result.get('provenance', {}).get('static_feature_count'),
+            'training_targets': result.get('training_targets'),
+            'training_donors_per_sample': result.get('training_donors_per_sample'),
+            'outer_donors': result.get('outer_donors'),
             'n': result['truth_timestamps'],
             **{f'ensemble_{k}': v for k, v in ensemble['regression'].items()},
             **{f'ensemble_{k}': v for k, v in ensemble['events'].items()},
@@ -88,6 +99,27 @@ def rebuild_summary(output_root: Path) -> None:
     ensemble = np.concatenate(ensemble_predictions)
     oracle = np.concatenate(oracle_predictions)
     aggregate = {
+        'protocol': {
+            'outer_loso': True,
+            'station_count': int(len(frame)),
+            'model_versions': sorted(frame['model_version'].dropna().astype(str).unique().tolist()),
+            'code_revisions': sorted(frame['code_revision'].dropna().astype(str).unique().tolist()),
+            'train_periods': sorted({
+                f'{row.train_start}..{row.train_end}'
+                for row in frame.itertuples()
+                if pd.notna(row.train_start) and pd.notna(row.train_end)
+            }),
+            'test_periods': sorted({
+                f'{row.test_start}..{row.test_end}'
+                for row in frame.itertuples()
+                if pd.notna(row.test_start) and pd.notna(row.test_end)
+            }),
+            'dynamic_channel_counts': sorted(frame['dynamic_channel_count'].dropna().astype(int).unique().tolist()),
+            'static_feature_counts': sorted(frame['static_feature_count'].dropna().astype(int).unique().tolist()),
+            'training_target_counts': sorted(frame['training_targets'].dropna().astype(int).unique().tolist()),
+            'training_donor_counts': sorted(frame['training_donors_per_sample'].dropna().astype(int).unique().tolist()),
+            'outer_donor_counts': sorted(frame['outer_donors'].dropna().astype(int).unique().tolist()),
+        },
         'completed_stations': int(len(frame)),
         'total_truth_timestamps': int(len(truth)),
         'ensemble': {

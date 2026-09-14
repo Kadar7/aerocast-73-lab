@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import random
+import subprocess
 import time
 from pathlib import Path
 
@@ -45,6 +47,60 @@ from train_formal import (
     train_epoch,
     validate_epoch,
 )
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def code_revision() -> str | None:
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def run_provenance(static_columns: list[str], model_version: str) -> dict:
+    return {
+        'code_revision': code_revision(),
+        'model_version': model_version,
+        'train_period': [CFG.train_start, CFG.train_end],
+        'test_period': [CFG.test_start, CFG.test_end],
+        'history_hours': int(CFG.history_hours),
+        'dynamic_channels': list(CFG.dynamic_items),
+        'dynamic_channel_count': int(CFG.n_dynamic_channels),
+        'raw_wind_enters_model': False,
+        'target_dynamic_history_used': False,
+        'static_feature_count': int(len(static_columns)),
+        'static_pca': False,
+        'static_columns': list(static_columns),
+        'static_sha256': file_sha256(CFG.static_path),
+        'cluster_sha256': file_sha256(CFG.cluster_path),
+        'geometry': ['log1p(distance_km)', 'sin(donor_to_target_bearing)', 'cos(donor_to_target_bearing)'],
+        'missing_handling': {
+            'dynamic_imputation': False,
+            'finite_placeholder_after_scaling': 0.0,
+            'binary_mask_same_shape': True,
+            'drop_sample_only_when_target_pm25_missing': True,
+        },
+        'wind': {
+            'input_direction': 'meteorological FROM',
+            'transport_direction': 'TOWARD=(FROM+180)%360',
+            'bearing': 'donor->target',
+            'along_positive': 'toward target',
+        },
+        'event_threshold': float(os.environ.get('DL_TCN_EVENT_THRESHOLD', '35.0')),
+        'absolute_error_threshold': float(os.environ.get('DL_TCN_ABS_ERROR_THRESHOLD', '20.0')),
+    }
 
 
 def safe_divide(numerator: int, denominator: int) -> float:
@@ -281,6 +337,9 @@ def main() -> None:
     amp_dtype = amp_dtype_for(device)
     grad_scaler = make_grad_scaler(amp_dtype == torch.float16)
     station_weights = make_station_sample_weights(train_ds, len(static), device)
+    provenance = run_provenance(
+        static_cols, 'v2' if v2_enabled() else 'v1'
+    )
 
     resume_raw = os.environ.get('DL_TCN_REFIT_RESUME_PATH', '').strip()
     resume_path = Path(resume_raw) if resume_raw else None
@@ -294,6 +353,7 @@ def main() -> None:
         'outer_donors': 72,
         'model_parameters': sum(p.numel() for p in base_model.parameters()),
         'model_version': 'v2' if v2_enabled() else 'v1',
+        'provenance': provenance,
         'background': background_audit,
         'smoke': smoke,
         'fused_adamw': fused,
@@ -415,6 +475,7 @@ def main() -> None:
         'sitename': str(static.loc[outer, 'sitename']),
         'selection_used_outer_truth': False,
         'model_version': 'v2' if v2_enabled() else 'v1',
+        'provenance': provenance,
         'uses_target_meteorology': False if v2_enabled() else None,
         'v2_config': v2_config_payload() if v2_enabled() else None,
         'background': background_audit,
