@@ -10,7 +10,8 @@ V7 使用 context-held-out gradient operator。每個 donor 的實測 PM2.5
 - 60 training / 12 validation；training donor 59、validation donor 60。
 - 24 小時 causal history、static49、9 raw channels 與衍生 wind along/cross。
 - 不使用 target dynamic、target weather、background、MLDG、LGBM 或 epoch selector。
-- fold 0、3 各跑 5 epochs；這是探索性 performance pilot。
+- fold 0、3 各跑 15 個完整 epochs。每個 epoch 會將全部 training samples
+  隨機排列一次，並且每筆恰好使用一次。
 
 ## Colab 一格執行
 
@@ -44,12 +45,11 @@ os.environ.update({
     'DL_TCN_TARGET_SITE': '桃園',
     'DL_TCN_COMPILE_MODE': 'off',
     'V7_FOLDS': '0,3',
-    'V7_EPOCHS': '5',
-    'V7_BATCH_SIZE': '16',
-    'V7_VALIDATION_BATCH_SIZE': '16',
-    'V7_STEPS_PER_EPOCH': '400',
-    'V7_OUTPUT_ROOT': '/content/DL_TCN_V7_CHOGO_PILOT',
-    'V7_DRIVE_OUTPUT': '/content/drive/MyDrive/DL_TCN_V7_CHOGO_PILOT',
+    'V7_EPOCHS': '15',
+    'V7_BATCH_SIZE': '256',
+    'V7_VALIDATION_BATCH_SIZE': '256',
+    'V7_OUTPUT_ROOT': '/content/DL_TCN_V7_CHOGO_B256_E15',
+    'V7_DRIVE_OUTPUT': '/content/drive/MyDrive/DL_TCN_V7_CHOGO_B256_E15',
 })
 subprocess.run([sys.executable,str(repo/'verify_colab_setup.py')],cwd=repo,check=True)
 subprocess.run([sys.executable,str(repo/'tests/test_v7_chogo.py')],cwd=repo,check=True)
@@ -60,7 +60,7 @@ subprocess.run([sys.executable,'-u',str(repo/'run_v7_chogo_pilot.py')],cwd=repo,
 `pilot_summary.json`、best checkpoint、
 逐站指標與壓縮 predictions，並同步到：
 
-`/content/drive/MyDrive/DL_TCN_V7_CHOGO_PILOT`
+`/content/drive/MyDrive/DL_TCN_V7_CHOGO_B256_E15`
 
-如果顯存不足，只降低 `V7_BATCH_SIZE`；不要修改模型寬度。若要延長完整
-pilot，再把 `V7_EPOCHS` 改成 15 或 25。
+目前正式設定是 batch 256、15 個完整 epochs，不再使用固定 steps 的
+隨機抽樣 pilot。

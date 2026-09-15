@@ -113,13 +113,19 @@ def run_fold(fold,train_idx,val_idx,cube,timestamps,static,cols,distance,device,
     print(json.dumps({"fold":fold,"train_samples":len(train_ds),"validation_samples":len(val_ds),
         "model_parameters":sanity["parameters"],"sanity":sanity,
         "feature_precompute_seconds":builder.precompute_seconds,"feature_tables_mb":builder.precomputed_table_mb},ensure_ascii=False),flush=True)
-    steps=int(os.environ.get("V7_STEPS_PER_EPOCH","400"));history=[];best=float("inf");best_payload=None
+    history=[];best=float("inf");best_payload=None
     best_station=None;best_predictions=None;started=time.perf_counter()
     for epoch in range(1,epochs+1):
         model.train();torch.cuda.reset_peak_memory_stats(device);epoch_start=time.perf_counter();loss_sum=0.0;seen=0
-        bar=tqdm(range(steps),desc=f"V7 fold {fold} epoch {epoch}/{epochs}",unit="batch",dynamic_ncols=True)
-        for _ in bar:
-            idx=rng.choice(len(train_ds),size=batch_size,replace=False)
+        # A real epoch visits every training sample exactly once.  The earlier
+        # limited-pilot loop drew an independent random batch at every step,
+        # which allowed repeats across steps and left other samples unseen.
+        epoch_indices=rng.permutation(len(train_ds))
+        starts=range(0,len(epoch_indices),batch_size)
+        bar=tqdm(starts,total=math.ceil(len(epoch_indices)/batch_size),
+            desc=f"V7 fold {fold} epoch {epoch}/{epochs}",unit="batch",dynamic_ncols=True)
+        for start in bar:
+            idx=epoch_indices[start:start+batch_size]
             batch=adapter.prepare(builder(_raw_batch(train_ds,idx)))
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type,dtype=dtype,enabled=dtype is not None):
@@ -195,7 +201,7 @@ def main():
     os.environ.setdefault("DL_TCN_COMPILE_MODE","off");runtime=apply_runtime_profile(CFG)
     if CFG.device.type!="cuda": raise RuntimeError("V7 pilot requires a Colab CUDA GPU")
     torch.set_num_threads(min(12,os.cpu_count() or 1));torch.backends.cuda.matmul.allow_tf32=True
-    epochs=int(os.environ.get("V7_EPOCHS","5"));batch_size=int(os.environ.get("V7_BATCH_SIZE","16"))
+    epochs=int(os.environ.get("V7_EPOCHS","15"));batch_size=int(os.environ.get("V7_BATCH_SIZE","256"))
     folds=tuple(int(x) for x in os.environ.get("V7_FOLDS","0,3").split(","))
     root=Path(os.environ.get("V7_OUTPUT_ROOT","/content/DL_TCN_V7_CHOGO_PILOT"))
     if "/drive/" in str(root): raise RuntimeError("V7_OUTPUT_ROOT must be /content; Drive copy occurs only after completion")
@@ -204,7 +210,8 @@ def main():
     distance=haversine_matrix(static.longitude,static.latitude)
     group_counts=np.bincount(fixed_hash_groups(static.siteid),minlength=4).tolist()
     settings={"revision":REVISION,"outer":{"index":outer,"siteid":str(static.loc[outer,"siteid"]),"sitename":str(static.loc[outer,"sitename"])},
-        "folds":list(folds),"epochs":epochs,"batch_size":batch_size,"steps_per_epoch":int(os.environ.get("V7_STEPS_PER_EPOCH","400")),
+        "folds":list(folds),"epochs":epochs,"batch_size":batch_size,
+        "epoch_definition":"one full random permutation of every training sample",
         "train_period":[CFG.train_start,CFG.train_end],"history_hours":24,"dynamic_items":list(CFG.dynamic_items),
         "hash_group_counts":group_counts,"runtime":runtime,"write_policy":"nothing during training; one compact write+Drive sync after all folds finish"}
     print(json.dumps(settings,ensure_ascii=False,indent=2),flush=True);results=[]
