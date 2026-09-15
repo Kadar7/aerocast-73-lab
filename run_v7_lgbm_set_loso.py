@@ -19,7 +19,11 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    def tqdm(values, **_kwargs):
+        return values
 
 from config import CFG
 from data_pipeline import (
@@ -50,7 +54,11 @@ def output_root() -> Path:
     if requested:
         return Path(requested)
     drive = Path("/content/drive/MyDrive")
-    return (drive / "AeroCast_V7_essential") if drive.is_dir() else (Path("/content") / "AeroCast_V7_essential")
+    if drive.is_dir():
+        return drive / "AeroCast_V7_essential"
+    if Path("/content").is_dir():
+        return Path("/content/AeroCast_V7_essential")
+    return CFG.output_dir / "AeroCast_V7_essential"
 
 
 OUT = output_root()

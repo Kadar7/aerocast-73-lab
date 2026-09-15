@@ -13,7 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # Minimal local CPU environments do not need tqdm.
+    def tqdm(values, **_kwargs):
+        return values
 
 from config import CFG
 from data_pipeline import build_or_load_hourly_cube, haversine_matrix, load_static
@@ -35,7 +39,11 @@ def output_root() -> Path:
     if requested:
         return Path(requested)
     drive = Path("/content/drive/MyDrive")
-    return (drive / "AeroCast_V7_essential") if drive.is_dir() else (Path("/content") / "AeroCast_V7_essential")
+    if drive.is_dir():
+        return drive / "AeroCast_V7_essential"
+    if Path("/content").is_dir():
+        return Path("/content/AeroCast_V7_essential")
+    return CFG.output_dir / "AeroCast_V7_essential"
 
 
 def prepare_cube():
