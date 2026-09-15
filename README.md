@@ -8,6 +8,8 @@
 - V2：加入 train-only background/anomaly、49 項 donor-target static 差異、
   physics-guided attention、station-pair virtual target 與高污染 tail-aware
   loss。V2 **不使用 target 氣象或 target dynamic history**。
+- V7 pilot：context-held-out gradient operator。詳細規格與一格 Colab
+  執行方式見 [V7_README.md](V7_README.md)。
 
 完整 V2 方法說明見 [V2_README.md](V2_README.md)。
 
