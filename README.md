@@ -2,12 +2,15 @@
 
 臺灣 73 個空氣品質測站的 unseen-station cold-start PM2.5 nowcast。
 
-目前保留兩個版本：
+目前保留三個深度學習版本及一個 V7 LightGBM：
 
 - V1：shared causal TCN + target-conditioned cross-attention。
 - V2：加入 train-only background/anomaly、49 項 donor-target static 差異、
   physics-guided attention、station-pair virtual target 與高污染 tail-aware
   loss。V2 **不使用 target 氣象或 target dynamic history**。
+- V7：station-balanced L2 LightGBM，將所有 donor 轉為 permutation-invariant
+  多尺度地理／靜態／上風向摘要；60/12 選 boosting iteration，接著以其餘
+  72 站 refit，outer target 僅在最後評估。
 
 完整 V2 方法說明見 [V2_README.md](V2_README.md)。
 
@@ -93,3 +96,26 @@ V1 的 73 站入口仍為：
 ```
 
 資料、checkpoint、CSV 結果與 Google Drive 輸出不存放在此公開 repository。
+
+## V7 LightGBM 與自適應 IDW
+
+兩者都不使用 outer target 的歷史污染或未來 truth 來選參數。輸出預設只保留
+必要摘要至 `/content/drive/MyDrive/AeroCast_V7_essential/`。
+
+```python
+import os
+os.environ["DL_TCN_DATA_ROOT"] = "/content/dl_tcn_data"
+os.environ["AEROCAST_V7_OUTPUT"] = "/content/drive/MyDrive/AeroCast_V7_essential"
+
+# IDW power：2023-24 建 power curves、2024-25 nested 選規則、2025-26 outer test
+!python -u run_adaptive_idw_power_loso.py
+
+# 先跑三個代表站；完成的測站會自動跳過
+!python -u run_v7_lgbm_set_loso.py --stations 桃園,菜寮,恆春
+
+# 確認後跑完整 73 站
+!python -u run_v7_lgbm_set_loso.py
+```
+
+V7 的 large feature matrices 只存在 `/content/AeroCast_V7_work/`，每站完成即
+刪除；Drive 僅保留 design、逐站結果 JSON 與合併 CSV。
