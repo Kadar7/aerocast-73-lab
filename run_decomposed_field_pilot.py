@@ -12,7 +12,9 @@ import json
 import math
 import os
 import shutil
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +52,32 @@ PILOT_BUDGET_SECONDS = 2.0 * 60 * 60
 AVAILABLE_A100_SECONDS = 30.0 * 60 * 60
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASELINE_PATH = SCRIPT_DIR / "resources" / "v8_fold03_locked_baseline.csv"
+
+
+@contextmanager
+def visible_stage(name, heartbeat_seconds=20.0):
+    """Keep slow setup work visible in notebook output."""
+    started = time.perf_counter()
+    stopped = threading.Event()
+    print(f"[START] {name}", flush=True)
+
+    def heartbeat():
+        while not stopped.wait(heartbeat_seconds):
+            elapsed = time.perf_counter() - started
+            print(f"[WORKING] {name} | elapsed={elapsed:.0f}s", flush=True)
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        yield
+    except BaseException:
+        elapsed = time.perf_counter() - started
+        print(f"[FAILED] {name} | elapsed={elapsed:.1f}s", flush=True)
+        raise
+    finally:
+        stopped.set(); worker.join(timeout=1.0)
+    elapsed = time.perf_counter() - started
+    print(f"[DONE] {name} | elapsed={elapsed:.1f}s", flush=True)
 
 
 def forward_model(model, batch, adapter, *, need_weights=False):
@@ -169,7 +197,8 @@ def benchmark(train_ds, val_ds, builder, adapter, device, seed):
     optimizer, fused = optimizer_for(model, device)
     dtype = amp_dtype_for(device); scaler = make_grad_scaler(dtype == torch.float16)
     train_times = []
-    for iteration in range(60):
+    train_progress = tqdm(range(60), desc="preflight train benchmark", unit="batch", dynamic_ncols=True)
+    for iteration in train_progress:
         started = time.perf_counter(); item = schedule.next_batch()
         batch = adapter.prepare(builder(raw_batch(item.station_indices, item.time_indices)))
         optimizer.zero_grad(set_to_none=True)
@@ -187,7 +216,8 @@ def benchmark(train_ds, val_ds, builder, adapter, device, seed):
     eval_times = []
     model.eval()
     with torch.inference_mode():
-        for iteration in range(35):
+        eval_progress = tqdm(range(35), desc="preflight validation benchmark", unit="batch", dynamic_ncols=True)
+        for iteration in eval_progress:
             start = (iteration * VALIDATION_BATCH_SIZE) % len(val_ds)
             idx = np.arange(start, min(start + VALIDATION_BATCH_SIZE, len(val_ds)))
             started = time.perf_counter()
@@ -231,21 +261,27 @@ def save_resume(payload, local_path, drive_path):
 def train_fold(fold, train_idx, val_idx, cube, timestamps, static, static_cols,
                distance, device, local_root, drive_root):
     fold_started = time.perf_counter()
-    scaler = fit_train_only_scaler(cube, timestamps, static, static_cols, train_idx)
-    scaled = standardize_static(static, static_cols, scaler)
-    train_ds = ColdStartStationDataset(
-        train_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps,
-        static, scaled, distance, scaler,
-    )
-    val_ds = ColdStartStationDataset(
-        val_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps,
-        static, scaled, distance, scaler,
-    )
+    print(f"\n===== FOLD {fold} START | train=60 validation=12 | max_epoch=20 =====", flush=True)
+    with visible_stage(f"fold {fold}: fit train-only scalers"):
+        scaler = fit_train_only_scaler(cube, timestamps, static, static_cols, train_idx)
+        scaled = standardize_static(static, static_cols, scaler)
+    with visible_stage(f"fold {fold}: build compact train/validation row indices"):
+        train_ds = ColdStartStationDataset(
+            train_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps,
+            static, scaled, distance, scaler,
+        )
+        val_ds = ColdStartStationDataset(
+            val_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps,
+            static, scaled, distance, scaler,
+        )
+    print(f"[ROWS] fold={fold} train={len(train_ds):,} validation={len(val_ds):,}", flush=True)
     hidden = np.setdiff1d(np.arange(len(static)), train_idx)
-    builder = DeviceFeatureBuilder(
-        train_idx, cube, max(int(train_ds.row_times.max()), int(val_ds.row_times.max())),
-        timestamps, static, scaled, distance, scaler, hidden, device,
-    )
+    with visible_stage(f"fold {fold}: precompute GPU feature tables"):
+        builder = DeviceFeatureBuilder(
+            train_idx, cube, max(int(train_ds.row_times.max()), int(val_ds.row_times.max())),
+            timestamps, static, scaled, distance, scaler, hidden, device,
+        )
+    print(f"[GPU TABLES] fold={fold} seconds={builder.precompute_seconds:.1f} MiB={builder.precomputed_table_mb:.1f}", flush=True)
     adapter = V8Adapter(timestamps, scaler, device)
     schedule = BalancedStationTimeSchedule(valid_times_by_station(train_ds), seed=CFG.seed + fold * 1009)
     model = DecomposedFieldNowcaster(dropout=.10).to(device)
@@ -287,7 +323,16 @@ def train_fold(fold, train_idx, val_idx, cube, timestamps, static, static_cols,
         epoch = schedule.epoch + 1; epoch_started = time.perf_counter()
         loss_sums = {"total": 0.0, "main_mse": 0.0, "level_mse": 0.0, "anomaly_center_mse": 0.0}
         seen = 0; model.train()
-        progress = tqdm(schedule.iter_epoch(), total=len(schedule), desc=f"fold {fold} epoch {epoch}", unit="batch", dynamic_ncols=True)
+        completed_in_epoch = schedule.station_round * schedule.batches_per_station_round + schedule.batch_in_round
+        remaining_batches = len(schedule) - completed_in_epoch
+        print(
+            f"[EPOCH START] fold={fold} epoch={epoch}/{planned_stop_epoch} "
+            f"remaining_batches={remaining_batches:,}", flush=True,
+        )
+        progress = tqdm(
+            schedule.iter_epoch(), total=remaining_batches,
+            desc=f"fold {fold} epoch {epoch}", unit="batch", dynamic_ncols=True,
+        )
         for item in progress:
             batch = adapter.prepare(builder(raw_batch(item.station_indices, item.time_indices)))
             optimizer.zero_grad(set_to_none=True)
@@ -326,6 +371,12 @@ def train_fold(fold, train_idx, val_idx, cube, timestamps, static, static_cols,
         history.append(row)
         station_history.extend({"epoch": epoch, **record} for record in per_station.to_dict("records"))
         print(json.dumps({"fold": fold, **row}, ensure_ascii=False), flush=True)
+        print(
+            f"[EPOCH DONE] fold={fold} epoch={epoch} "
+            f"macro_rmse={metrics['macro_rmse']:.4f} r2={metrics['r2']:.4f} "
+            f"bias={metrics['bias']:.4f} seconds={row['runtime_seconds']:.1f}",
+            flush=True,
+        )
         if metrics["macro_rmse"] < best_macro:
             best_macro = metrics["macro_rmse"]
             best = {
@@ -366,6 +417,11 @@ def train_fold(fold, train_idx, val_idx, cube, timestamps, static, static_cols,
         "fused_adamw": fused,
     }
     atomic_json(result, fold_dir / "fold_result.json")
+    print(
+        f"===== FOLD {fold} DONE | best_epoch={result['best_epoch']} "
+        f"macro_rmse={metrics['macro_rmse']:.4f} runtime={result['runtime_seconds']/60:.1f}min =====",
+        flush=True,
+    )
     # A completed fold keeps only research-essential compact artefacts on Drive.
     if drive_fold is not None:
         drive_fold.mkdir(parents=True, exist_ok=True)
@@ -434,22 +490,35 @@ def main():
     local_root.mkdir(parents=True, exist_ok=True)
     if drive_root is not None: drive_root.mkdir(parents=True, exist_ok=True)
 
-    static, clusters, cols = load_static(); outer = target_index(static, CFG.target_site)
-    splits = make_meta_crossfit_folds(clusters, outer)
-    cube, timestamps = build_or_load_hourly_cube(static)
-    distance = haversine_matrix(static.longitude, static.latitude)
+    print(json.dumps({
+        "status": "STARTING", "revision": REVISION, "gpu": torch.cuda.get_device_name(0),
+        "plan": "preflight -> fold0 -> fold3 -> locked V8 comparison",
+        "epochs": "15 recorded; convergence check at 18; hard cap 20",
+        "drive_output": str(drive_root) if drive_root is not None else None,
+    }, ensure_ascii=False, indent=2), flush=True)
+    with visible_stage("load static features and construct fixed 60/12 folds"):
+        static, clusters, cols = load_static(); outer = target_index(static, CFG.target_site)
+        splits = make_meta_crossfit_folds(clusters, outer)
+        distance = haversine_matrix(static.longitude, static.latitude)
+    with visible_stage("load or build hourly AQ cube"):
+        cube, timestamps = build_or_load_hourly_cube(static)
 
     # Exact-path preflight on fold 0 before any training.
     train_idx, val_idx = splits[0]
-    scaler = fit_train_only_scaler(cube, timestamps, static, cols, train_idx)
-    scaled = standardize_static(static, cols, scaler)
-    train_ds = ColdStartStationDataset(train_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps, static, scaled, distance, scaler)
-    val_ds = ColdStartStationDataset(val_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps, static, scaled, distance, scaler)
+    with visible_stage("preflight: fit fold-0 train-only scalers"):
+        scaler = fit_train_only_scaler(cube, timestamps, static, cols, train_idx)
+        scaled = standardize_static(static, cols, scaler)
+    with visible_stage("preflight: build compact row indices"):
+        train_ds = ColdStartStationDataset(train_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps, static, scaled, distance, scaler)
+        val_ds = ColdStartStationDataset(val_idx, train_idx, CFG.train_start, CFG.train_end, cube, timestamps, static, scaled, distance, scaler)
+    print(f"[ROWS] preflight train={len(train_ds):,} validation={len(val_ds):,}", flush=True)
     hidden = np.setdiff1d(np.arange(len(static)), train_idx)
-    builder = DeviceFeatureBuilder(train_idx, cube, max(int(train_ds.row_times.max()), int(val_ds.row_times.max())), timestamps, static, scaled, distance, scaler, hidden, CFG.device)
+    with visible_stage("preflight: precompute GPU feature tables"):
+        builder = DeviceFeatureBuilder(train_idx, cube, max(int(train_ds.row_times.max()), int(val_ds.row_times.max())), timestamps, static, scaled, distance, scaler, hidden, CFG.device)
     adapter = V8Adapter(timestamps, scaler, CFG.device)
     benchmark_started = time.perf_counter()
-    measured = benchmark(train_ds, val_ds, builder, adapter, CFG.device, CFG.seed + 9100)
+    with visible_stage("preflight: exact forward/backward and validation benchmark"):
+        measured = benchmark(train_ds, val_ds, builder, adapter, CFG.device, CFG.seed + 9100)
     benchmark_seconds = time.perf_counter() - benchmark_started
     steps_per_epoch = int(measured["steps_per_epoch"])
     validation_batches = math.ceil(len(val_ds) / VALIDATION_BATCH_SIZE)
@@ -476,6 +545,11 @@ def main():
     atomic_json(profile, local_root / "preflight.json")
     if drive_root is not None: sync_file(local_root / "preflight.json", drive_root / "preflight.json")
     print(json.dumps(profile, ensure_ascii=False, indent=2), flush=True)
+    print(
+        f"[PREFLIGHT COST] two-fold worst20={two_fold20/60:.1f}min "
+        f"| limit={PILOT_BUDGET_SECONDS/60:.0f}min",
+        flush=True,
+    )
     del builder, adapter, train_ds, val_ds
     torch.cuda.empty_cache()
     if two_fold20 > PILOT_BUDGET_SECONDS or two_fold20 > AVAILABLE_A100_SECONDS:
@@ -486,6 +560,7 @@ def main():
 
     results = []
     for fold in FOLDS:
+        print(f"[QUEUE] next fold={fold} | completed={len(results)}/{len(FOLDS)}", flush=True)
         completed = drive_root / f"fold_{fold:02d}" / "fold_result.json" if drive_root is not None else local_root / f"fold_{fold:02d}" / "fold_result.json"
         if completed.exists():
             local_fold = local_root / f"fold_{fold:02d}"
@@ -498,6 +573,7 @@ def main():
             distance, CFG.device, local_root, drive_root,
         ))
     summary = evaluate_gate(results, local_root, drive_root)
+    print(f"[ALL DONE] status={summary['status']} | output={local_root}", flush=True)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 

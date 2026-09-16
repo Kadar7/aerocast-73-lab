@@ -4,6 +4,10 @@ Select an A100 runtime, upload `dl_tcn_colab_data.zip` to `/content`, then run
 this one cell. The pilot shows batch/epoch progress, resumes from Drive after a
 disconnect, and automatically writes its compact final summary to Drive.
 
+Slow setup stages print `START`, a `WORKING` heartbeat every 20 seconds, and
+`DONE`. Benchmark, training and validation display batch progress and ETA;
+every epoch also prints its metrics and runtime.
+
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
