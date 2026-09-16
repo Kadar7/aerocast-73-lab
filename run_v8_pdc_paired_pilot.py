@@ -34,7 +34,7 @@ from v7_training import calendar6
 from v8_sampling import BalancedStationTimeSchedule
 
 
-REVISION = "v8_pdc_paired_pilot_2"
+REVISION = "v8_pdc_paired_pilot_3"
 FOLDS = (0, 3)
 ARMS = ("control", "treatment")
 MIN_EPOCHS = 8
@@ -42,7 +42,9 @@ MAX_EPOCHS = 20
 PATIENCE = 5
 TRAIN_BATCH_SIZE = 256  # fixed by 4 stations x 64 times
 VALIDATION_BATCH_SIZE = 512
-PREFLIGHT_LIMIT_SECONDS = 45 * 60
+# The measured A100 worst case for four complete arms is about 57 minutes.
+# Keep a real safety margin without reducing epochs, steps or model capacity.
+PREFLIGHT_LIMIT_SECONDS = 75 * 60
 LOCAL_CHECKPOINT_EVERY_STEPS = 200
 IMPROVEMENT_EPSILON = 0.01
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -175,6 +177,36 @@ def validate_existing_manifest(path: Path, expected: str) -> None:
         validate_protocol_fingerprint(payload, expected, str(path))
 
 
+def clear_abort_only_root(root: Path | None) -> bool:
+    """Remove stale preflight-only metadata, never trained artefacts.
+
+    Revision 2 could abort after benchmarking because its 45-minute ceiling
+    was lower than the measured 57-minute worst case.  That abort changes no
+    model state, but its old protocol manifest would block the corrected run.
+    """
+    if root is None or not root.exists():
+        return False
+    gate = root / "paired_pilot_gate.json"
+    if not gate.exists():
+        return False
+    try:
+        payload = json.loads(gate.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if payload.get("status") != "ABORTED_BEFORE_TRAINING":
+        return False
+    protected = ("result.json", "active_resume.pt", "best_model.pt")
+    if any(any(root.rglob(name)) for name in protected):
+        raise RuntimeError(f"Refusing to clear aborted root containing trained artefacts: {root}")
+    for name in (
+        "protocol_manifest.json", "preflight_cost.json", "paired_pilot_gate.json",
+        "preflight_io.tmp.pt",
+    ):
+        (root / name).unlink(missing_ok=True)
+    print(f"CLEARED stale abort-only metadata: {root}", flush=True)
+    return True
+
+
 def phase_action(phase: str, epoch: int, bad_epochs: int) -> str:
     if phase not in PHASES:
         raise RuntimeError(f"invalid resume phase: {phase!r}")
@@ -261,7 +293,7 @@ def project_complete_cost(*, train_step_seconds: float, validation_batch_seconds
         "benchmark_seconds": benchmark_seconds,
         "projected_complete_pilot_seconds": projected,
         "preflight_limit_seconds": PREFLIGHT_LIMIT_SECONDS,
-        "within_45_minute_limit": projected <= PREFLIGHT_LIMIT_SECONDS,
+        "within_preflight_limit": projected <= PREFLIGHT_LIMIT_SECONDS,
     }
 
 
@@ -907,6 +939,10 @@ def main() -> None:
         "V8_PDC_DRIVE_OUTPUT", str(drive_base / "DL_TCN_V8_PDC_PAIRED_PILOT")
     )) if drive_base.is_dir() else None
     local_root.mkdir(parents=True, exist_ok=True)
+    # Safe migration from revision 2: only its metadata-only aborted run is
+    # cleared. Any checkpoint or completed result makes this refuse deletion.
+    clear_abort_only_root(local_root)
+    clear_abort_only_root(drive_root)
 
     complete_setup_started = time.perf_counter()
     static, clusters, static_cols = load_static()
@@ -974,11 +1010,14 @@ def main() -> None:
     if drive_root is not None:
         sync_file(local_root / "preflight_cost.json", drive_root / "preflight_cost.json")
     print(json.dumps({"manifest": manifest, "preflight": preflight}, ensure_ascii=False, indent=2), flush=True)
-    if not preflight["within_45_minute_limit"]:
+    if not preflight["within_preflight_limit"]:
         abort = {
             "status": "ABORTED_BEFORE_TRAINING", "revision": REVISION,
             "protocol_fingerprint": protocol_fingerprint,
-            "reason": "complete paired pilot worst-case projection exceeds 45 minutes",
+            "reason": (
+                "complete paired pilot worst-case projection exceeds "
+                f"{PREFLIGHT_LIMIT_SECONDS / 60:.0f} minutes"
+            ),
             "preflight": preflight, "full73_launched": False,
         }
         local_gate = local_root / "paired_pilot_gate.json"

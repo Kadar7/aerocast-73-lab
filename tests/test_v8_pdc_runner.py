@@ -21,6 +21,7 @@ from run_v8_pdc_paired_pilot import (
     MAX_EPOCHS,
     REVISION,
     checkpoint_phase_after_batch,
+    clear_abort_only_root,
     no_new_negative_station_ids,
     load_frozen_v8_baseline,
     phase_action,
@@ -124,6 +125,30 @@ class PhaseTests(unittest.TestCase):
 
 
 class GateAndCostTests(unittest.TestCase):
+    def test_clear_abort_only_root_removes_only_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "paired_pilot_gate.json").write_text(
+                json.dumps({"status": "ABORTED_BEFORE_TRAINING"}), encoding="utf-8"
+            )
+            (root / "protocol_manifest.json").write_text("{}", encoding="utf-8")
+            (root / "preflight_cost.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(clear_abort_only_root(root))
+            self.assertFalse((root / "paired_pilot_gate.json").exists())
+            self.assertFalse((root / "protocol_manifest.json").exists())
+
+    def test_clear_abort_only_root_refuses_trained_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "paired_pilot_gate.json").write_text(
+                json.dumps({"status": "ABORTED_BEFORE_TRAINING"}), encoding="utf-8"
+            )
+            trained = root / "fold_00" / "control" / "result.json"
+            trained.parent.mkdir(parents=True)
+            trained.write_text("{}", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                clear_abort_only_root(root)
+
     def test_standardized_mse(self):
         prediction = torch.tensor([3.0, 7.0])
         label = torch.tensor([1.0, 3.0])
