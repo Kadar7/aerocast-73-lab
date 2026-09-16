@@ -445,7 +445,13 @@ def evaluate_gate(results, local_root, drive_root):
         old = baseline.loc[baseline.fold == fold].copy()
         merged = old.merge(current, on="station_index", suffixes=("_v8", "_new"), validate="one_to_one")
         if len(merged) != 12: raise RuntimeError(f"fold {fold} baseline station mismatch")
-        merged.insert(0, "fold", fold)
+        if "fold" in merged.columns:
+            if not bool((pd.to_numeric(merged["fold"], errors="raise") == fold).all()):
+                raise RuntimeError(f"fold {fold} baseline comparison contains another fold")
+            columns = ["fold", *[column for column in merged.columns if column != "fold"]]
+            merged = merged.loc[:, columns]
+        else:
+            merged.insert(0, "fold", fold)
         merged["rmse_change_fraction"] = merged.rmse_new / merged.rmse_v8 - 1.0
         comparisons.append(merged)
         old_macro = float(old.rmse.mean()); old_bias = float(old.bias.abs().mean())
